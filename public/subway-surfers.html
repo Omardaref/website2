@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Subway Surf</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+canvas {
+  display: block;
+  image-rendering: pixelated;
+}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ─── CANVAS SETUP ──────────────────────────────────────────────────────────────
+const C = document.getElementById('c');
+const X = C.getContext('2d');
+let W = 0, H = 0;
+
+function resize() {
+  const ratio = 9 / 16;
+  if (window.innerWidth / window.innerHeight <= ratio) {
+    W = window.innerWidth;
+    H = Math.min(window.innerHeight, Math.round(W / ratio));
+  } else {
+    H = window.innerHeight;
+    W = Math.round(H * ratio);
+  }
+  C.width = W;
+  C.height = H;
+  C.style.width = W + 'px';
+  C.style.height = H + 'px';
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ─── PERSPECTIVE HELPERS ───────────────────────────────────────────────────────
+// Vanishing point at top-center. Player at bottom-center.
+// Z=0 → player level (bottom), Z=FAR → vanishing point (top).
+const FAR = 100;
+
+function vpx() { return W * 0.5; }
+function vpy() { return H * 0.20; }
+function groundY() { return H * 0.80; }
+function laneBaseX(l) {
+  const xs = [W * 0.21, W * 0.50, W * 0.79];
+  return xs[Math.max(0, Math.min(2, l | 0))];
+}
+
+function laneXFloat(l) {
+  const fl = Math.floor(l), cl = Math.ceil(l);
+  if (fl === cl) return laneBaseX(fl);
+  return lerp(laneBaseX(fl), laneBaseX(cl), l - fl);
+}
+
+function project(lane, z, worldH) {
+  const t = Math.max(0, Math.min(1, z / FAR));
+  const bx = laneXFloat(lane);
+  const x = lerp(bx, vpx(), t);
+  const y = lerp(groundY(), vpy(), t);
+  const s = lerp(1.0, 0.04, t);
+  const yOff = (worldH || 0) * s * H * 0.30;
+  return { x, y: y - yOff, s, t };
+}
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+function easeIO(t) { return t < 0.5 ? 2*t*t : -1+(4-2*t)*t; }
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+// ─── PRE-COMPUTED BUILDINGS ────────────────────────────────────────────────────
+// Generate once to avoid per-frame random calls
+const BLDS = [];
+const BWINDOWS = [];
+(function initBuildings() {
+  const defs = [
+    [0.00,0.42,0.07,0.23],[0.07,0.48,0.05,0.17],[0.12,0.38,0.09,0.27],
+    [0.21,0.45,0.06,0.20],[0.27,0.36,0.08,0.29],[0.35,0.43,0.07,0.22],
+    [0.42,0.50,0.05,0.15],[0.47,0.40,0.06,0.25],[0.53,0.47,0.05,0.18],
+    [0.58,0.37,0.09,0.28],[0.67,0.44,0.06,0.21],[0.73,0.41,0.08,0.24],
+    [0.81,0.49,0.05,0.16],[0.86,0.38,0.08,0.27],[0.94,0.45,0.06,0.20],
+  ];
+  // Use seeded pseudo-random for window placement
+  let seed = 42;
+  function rnd() { seed = (seed * 1664525 + 1013904223) & 0xffffffff; return (seed >>> 0) / 0xffffffff; }
+  for (const [bx,by,bw,bh] of defs) {
+    BLDS.push([bx,by,bw,bh]);
+    const wins = [];
+    for (let wy = by + 0.012; wy < by + bh - 0.018; wy += 0.028) {
+      for (let wx = bx + 0.006; wx < bx + bw - 0.01; wx += 0.02) {
+        if (rnd() > 0.30) wins.push([wx, wy]);
+      }
+    }
+    BWINDOWS.push(wins);
+  }
+})();
+
+// ─── GAME STATE ────────────────────────────────────────────────────────────────
+let gs = 'menu'; // 'menu' | 'playing' | 'dead'
+let score = 0, coins = 0, dist = 0, spd = 3;
+let hi = +(localStorage.getItem('ssHi') || 0);
+let tick = 0;
+
+const PL = {
+  cur: 1.0,  // visual lane (float 0–2)
+  tgt: 1,    // target lane (int)
+  jumping: false, jt: 0,
+  sliding: false, st: 0,
+  dead: false, deathTick: 0,
+  runT: 0,
+  inv: 0,    // invincibility frames
+};
+
+let WORLD = [];      // active world objects
+let spawnCd = 50;   // frames until next spawn group
+
+// ─── WORLD OBJECTS ─────────────────────────────────────────────────────────────
+// Types: 'coin', 'barrier' (must jump), 'low' (slide or jump), 'train' (change lane)
+// All objects have: type, lane (0-2), z, [zEnd for trains], [collected/dead]
+
+function push(o) { WORLD.push(o); }
+
+function spawnNow() {
+  const far = FAR - 4;
+  const r = Math.random();
+  if (r < 0.18) {
+    // Coin line
+    const ln = (Math.random() * 3) | 0;
+    for (let i = 0; i < 7; i++) push({ type:'coin', lane:ln, z: far - i*7 });
+  } else if (r < 0.32) {
+    // Coin wave across lanes
+    const seq = [0,1,2,1,0,1,2];
+    seq.forEach((ln,i) => push({ type:'coin', lane:ln, z: far - i*6 }));
+  } else if (r < 0.50) {
+    // Single barrier
+    push({ type:'barrier', lane:(Math.random()*3)|0, z:far });
+  } else if (r < 0.65) {
+    // Two-lane barrier (one safe lane)
+    const safe = (Math.random()*3)|0;
+    for (let i=0;i<3;i++) if(i!==safe) push({ type:'barrier', lane:i, z:far });
+  } else if (r < 0.75) {
+    // Low barrier (slide or jump)
+    push({ type:'low', lane:(Math.random()*3)|0, z:far });
+  } else if (r < 0.88) {
+    // Train: 2 lanes blocked
+    const clear = (Math.random()*3)|0;
+    for (let i=0;i<3;i++) if(i!==clear) push({ type:'train', lane:i, z:far, zEnd:far+32 });
+  } else {
+    // Mixed: barrier in one lane + coins in another
+    const bl = (Math.random()*3)|0;
+    push({ type:'barrier', lane:bl, z:far });
+    const cl = bl===0 ? 2 : 0;
+    for (let i=1;i<=5;i++) push({ type:'coin', lane:cl, z:far-i*8 });
+  }
+}
+
+// ─── UPDATE ───────────────────────────────────────────────────────────────────
+function update() {
+  if (gs !== 'playing') return;
+  tick++;
+
+  // Speed ramp
+  spd = 3 + dist / 2800;
+
+  // Move world
+  for (const o of WORLD) {
+    o.z -= spd;
+    if (o.zEnd !== undefined) o.zEnd -= spd;
+  }
+  WORLD = WORLD.filter(o => !o.gone && (o.zEnd !== undefined ? o.zEnd : o.z) > -25);
+
+  // Player lane smooth lerp
+  const diff = PL.tgt - PL.cur;
+  if (Math.abs(diff) < 0.01) { PL.cur = PL.tgt; }
+  else { PL.cur += diff * 0.15; }
+
+  // Jump arc
+  if (PL.jumping) {
+    PL.jt += 1 / 44;
+    if (PL.jt >= 1) { PL.jumping = false; PL.jt = 0; }
+  }
+
+  // Slide countdown
+  if (PL.sliding) {
+    PL.st--;
+    if (PL.st <= 0) PL.sliding = false;
+  }
+
+  // Invincibility countdown
+  if (PL.inv > 0) PL.inv--;
+
+  // Run animation
+  PL.runT += 0.16;
+
+  // Advance
+  dist += spd;
+  score = Math.floor(dist / 8);
+
+  // Spawn
+  spawnCd--;
+  if (spawnCd <= 0) {
+    spawnNow();
+    spawnCd = Math.max(30, 70 - dist / 350) | 0;
+  }
+
+  // Collision
+  if (!PL.inv) checkCollision();
+}
+
+function jumpH() { return PL.jumping ? Math.sin(PL.jt * Math.PI) : 0; }
+
+function checkCollision() {
+  const jh = jumpH();
+  for (const o of WORLD) {
+    if (o.gone) continue;
+    const laneDiff = Math.abs(o.lane - PL.cur);
+    if (laneDiff >= 0.42) continue;
+
+    if (o.type === 'coin') {
+      if (o.z < 8 && o.z > -10) { o.gone = true; coins++; score += 10; }
+    } else {
+      const zFront = o.z;
+      const zBack = o.zEnd ?? o.z;
+      const inRange = zFront < 5 && zBack > -8;
+      if (!inRange) continue;
+      if (o.type === 'barrier' && jh >= 0.42) continue;
+      if (o.type === 'low' && (jh >= 0.20 || PL.sliding)) continue;
+      die();
+      return;
+    }
+  }
+}
+
+function die() {
+  if (PL.dead) return;
+  PL.dead = true;
+  PL.deathTick = tick;
+  PL.inv = 9999;
+  if (score > hi) { hi = score; localStorage.setItem('ssHi', hi); }
+  setTimeout(() => { gs = 'dead'; }, 1000);
+}
+
+// ─── RENDERING ────────────────────────────────────────────────────────────────
+
+function drawBackground() {
+  // Sky gradient
+  const sky = X.createLinearGradient(0, 0, 0, H * 0.72);
+  sky.addColorStop(0, '#04091a');
+  sky.addColorStop(0.50, '#0b1e5c');
+  sky.addColorStop(1, '#c8550e');
+  X.fillStyle = sky;
+  X.fillRect(0, 0, W, H * 0.72);
+
+  // Horizon glow
+  const glow = X.createRadialGradient(W/2, H*0.68, 0, W/2, H*0.68, W*0.55);
+  glow.addColorStop(0, 'rgba(255,150,40,0.45)');
+  glow.addColorStop(0.45, 'rgba(255,80,10,0.18)');
+  glow.addColorStop(1, 'rgba(0,0,0,0)');
+  X.fillStyle = glow;
+  X.fillRect(0, H*0.35, W, H*0.40);
+
+  // Buildings
+  for (let bi = 0; bi < BLDS.length; bi++) {
+    const [bx,by,bw,bh] = BLDS[bi];
+    X.fillStyle = '#060c20';
+    X.fillRect(W*bx, H*by, W*bw, H*bh);
+    X.fillStyle = 'rgba(255,220,100,0.18)';
+    for (const [wx,wy] of BWINDOWS[bi]) {
+      X.fillRect(W*wx, H*wy, W*0.010, H*0.016);
+    }
+  }
+
+  // Ground
+  const gnd = X.createLinearGradient(0, H*0.68, 0, H);
+  gnd.addColorStop(0, '#28160a');
+  gnd.addColorStop(1, '#0e0704');
+  X.fillStyle = gnd;
+  X.fillRect(0, H*0.68, W, H*0.32);
+}
+
+function drawTrack() {
+  const gY = groundY(), vY = vpy(), vX = vpx();
+
+  // Perspective floor tiles
+  const rows = 20;
+  for (let i = 0; i < rows; i++) {
+    const t0 = Math.pow(i / rows, 0.55);
+    const t1 = Math.pow((i+1) / rows, 0.55);
+    const y0 = lerp(gY, vY, t0), y1 = lerp(gY, vY, t1);
+    const hw0 = W * 0.38 * (1 - t0 * 0.94);
+    const hw1 = W * 0.38 * (1 - t1 * 0.94);
+    X.fillStyle = i%2===0 ? '#1c1008' : '#160d06';
+    X.beginPath();
+    X.moveTo(vX-hw0, y0); X.lineTo(vX+hw0, y0);
+    X.lineTo(vX+hw1, y1); X.lineTo(vX-hw1, y1);
+    X.closePath(); X.fill();
+  }
+
+  // Rail ties (horizontal bars)
+  for (let i = 1; i < 14; i++) {
+    const t = Math.pow(i/14, 0.5);
+    const ty = lerp(gY, vY, t);
+    const tw = W * 0.76 * (1 - t * 0.94);
+    X.beginPath(); X.moveTo(vX-tw/2, ty); X.lineTo(vX+tw/2, ty);
+    X.strokeStyle = 'rgba(110,70,30,0.55)';
+    X.lineWidth = Math.max(1, 2.8 * (1-t));
+    X.stroke();
+  }
+
+  // Rails (4 vertical lines = edges of 3 lanes)
+  const railXRatios = [0.165, 0.355, 0.645, 0.835];
+  for (const rx of railXRatios) {
+    const bx = W * rx;
+    X.beginPath(); X.moveTo(bx, gY); X.lineTo(vX, vY);
+    X.strokeStyle = 'rgba(170,130,55,0.65)';
+    X.lineWidth = 1.5; X.stroke();
+  }
+}
+
+function drawWorld() {
+  // Sort far → near so closer objects draw on top
+  const vis = WORLD.filter(o => !o.gone && o.z < FAR);
+  vis.sort((a,b) => {
+    const az = a.zEnd !== undefined ? Math.max(a.z, a.zEnd) : a.z;
+    const bz = b.zEnd !== undefined ? Math.max(b.z, b.zEnd) : b.z;
+    return bz - az;
+  });
+
+  for (const o of vis) {
+    const p = project(o.lane, o.z);
+    if (o.type === 'coin')    drawCoin(p.x, p.y, p.s);
+    else if (o.type === 'barrier') drawBarrier(p.x, p.y, p.s, false);
+    else if (o.type === 'low')     drawBarrier(p.x, p.y, p.s, true);
+    else if (o.type === 'train')   drawTrain(o);
+  }
+}
+
+function drawCoin(x, y, s) {
+  const r = H * 0.022 * s;
+  X.save();
+  X.shadowColor = '#ffd700'; X.shadowBlur = 12 * s;
+  X.fillStyle = '#ffd700';
+  X.beginPath(); X.ellipse(x, y, r, r, 0, 0, Math.PI*2); X.fill();
+  X.shadowBlur = 0;
+  X.fillStyle = '#ffe866';
+  X.beginPath(); X.ellipse(x - r*0.22, y - r*0.22, r*0.42, r*0.32, -0.4, 0, Math.PI*2); X.fill();
+  X.restore();
+}
+
+function drawBarrier(x, y, s, low) {
+  const w = W * 0.13 * s;
+  const h = H * (low ? 0.052 : 0.098) * s;
+  const col = low ? '#00c9a7' : '#ff6b35';
+  const col2 = low ? '#00ffe0' : '#ffaa55';
+
+  // Shadow on ground
+  X.fillStyle = 'rgba(0,0,0,0.22)';
+  X.beginPath(); X.ellipse(x, y+2, w*0.55, h*0.12, 0, 0, Math.PI*2); X.fill();
+
+  // Posts
+  X.fillStyle = '#999';
+  X.fillRect(x - w/2, y - h, w*0.09, h);
+  X.fillRect(x + w/2 - w*0.09, y - h, w*0.09, h);
+
+  // Top bar
+  X.fillStyle = col;
+  X.fillRect(x - w/2, y - h, w, h*0.24);
+  // Stripe
+  X.fillStyle = col2;
+  for (let i = 0; i < 4; i++) {
+    X.fillRect(x - w/2 + w*(i*0.25 + 0.04), y - h, w*0.07, h*0.24);
+  }
+
+  if (!low) {
+    // Second bar
+    X.fillStyle = col;
+    X.fillRect(x - w/2, y - h*0.52, w, h*0.24);
+    X.fillStyle = col2;
+    for (let i = 0; i < 4; i++) {
+      X.fillRect(x - w/2 + w*(i*0.25 + 0.04), y - h*0.52, w*0.07, h*0.24);
+    }
+  }
+}
+
+function drawTrain(o) {
+  const zF = o.z;
+  const zB = Math.min(FAR, o.zEnd);
+  const pF = project(o.lane, zF);
+  const pB = project(o.lane, zB);
+
+  const trainCols = ['#f0a700','#27ae60','#2980b9'];
+  const col = trainCols[o.lane];
+  const darkCol = ['#c47f00','#1e8449','#1f618d'][o.lane];
+
+  const wF = W * 0.065 * pF.s, hF = H * 0.18 * pF.s;
+  const wB = W * 0.065 * pB.s, hB = H * 0.18 * pB.s;
+
+  // Train body (top face)
+  X.beginPath();
+  X.moveTo(pB.x - wB, pB.y - hB);
+  X.lineTo(pB.x + wB, pB.y - hB);
+  X.lineTo(pF.x + wF, pF.y - hF);
+  X.lineTo(pF.x - wF, pF.y - hF);
+  X.closePath();
+  X.fillStyle = darkCol; X.fill();
+
+  // Side face (right side of track)
+  X.beginPath();
+  X.moveTo(pB.x + wB, pB.y - hB);
+  X.lineTo(pB.x + wB, pB.y);
+  X.lineTo(pF.x + wF, pF.y);
+  X.lineTo(pF.x + wF, pF.y - hF);
+  X.closePath();
+  X.fillStyle = col; X.fill();
+
+  // Front face
+  X.fillStyle = col;
+  X.fillRect(pF.x - wF, pF.y - hF, wF*2, hF);
+
+  // Front details: window
+  X.fillStyle = 'rgba(140,210,255,0.75)';
+  X.fillRect(pF.x - wF*0.68, pF.y - hF*0.80, wF*1.36, hF*0.38);
+  // Front details: stripe
+  X.fillStyle = darkCol;
+  X.fillRect(pF.x - wF, pF.y - hF*0.38, wF*2, hF*0.07);
+  // Headlights
+  X.fillStyle = '#fffacd';
+  X.beginPath(); X.ellipse(pF.x - wF*0.72, pF.y - hF*0.22, wF*0.14, hF*0.09, 0, 0, Math.PI*2); X.fill();
+  X.beginPath(); X.ellipse(pF.x + wF*0.72, pF.y - hF*0.22, wF*0.14, hF*0.09, 0, 0, Math.PI*2); X.fill();
+
+  // Body windows (side)
+  if (zF < FAR * 0.7) {
+    const wCount = 3;
+    for (let i = 0; i < wCount; i++) {
+      const wt = (i + 0.5) / wCount;
+      const wx = lerp(pF.x, pB.x, wt);
+      const wy = lerp(pF.y, pB.y, wt);
+      const ws = lerp(pF.s, pB.s, wt);
+      const rw = W * 0.025 * ws, rh = H * 0.048 * ws;
+      const rwx = lerp(wF, wB, wt);
+      X.fillStyle = 'rgba(140,210,255,0.55)';
+      X.fillRect(wx + rwx*0.15, wy - H*0.14*ws, rw, rh);
+    }
+  }
+}
+
+function drawCharacter() {
+  const isDead = PL.dead;
+  // Flicker on death
+  if (isDead) {
+    const dt = tick - PL.deathTick;
+    if (Math.floor(dt / 4) % 2 === 1) return;
+  }
+
+  const cx = laneXFloat(PL.cur);
+  const jh = jumpH();
+  const cy = groundY() - jh * H * 0.24;
+
+  const charH = H * 0.145;
+  const charW = charH * 0.48;
+
+  X.save();
+  X.translate(cx, cy);
+
+  if (PL.sliding) {
+    drawSlideChar(charW, charH * 0.52);
+  } else {
+    drawRunChar(charW, charH, PL.runT);
+  }
+
+  // Ground shadow
+  X.fillStyle = `rgba(0,0,0,${0.2 - jh * 0.15})`;
+  X.beginPath();
+  X.ellipse(0, 3, charW * (0.7 - jh * 0.3), charW * 0.18, 0, 0, Math.PI * 2);
+  X.fill();
+
+  X.restore();
+}
+
+function drawRunChar(w, h, t) {
+  const la = Math.sin(t) * 0.50;   // leg angle
+  const aa = Math.cos(t) * 0.32;   // arm angle
+
+  // Legs
+  X.lineCap = 'round';
+  X.lineJoin = 'round';
+  X.strokeStyle = '#111';
+  X.lineWidth = w * 0.33;
+
+  // Left leg
+  const lkx = -w*0.2 + Math.sin(la) * w * 0.28;
+  const lky = -h * 0.30 + Math.abs(Math.sin(t)) * h * 0.06;
+  X.beginPath();
+  X.moveTo(-w*0.2, -h*0.55);
+  X.lineTo(lkx, lky);
+  X.lineTo(-w*0.2 + Math.sin(la)*w*0.45, 0);
+  X.stroke();
+
+  // Right leg
+  const rkx = w*0.2 - Math.sin(la) * w * 0.28;
+  X.beginPath();
+  X.moveTo(w*0.2, -h*0.55);
+  X.lineTo(rkx, lky);
+  X.lineTo(w*0.2 - Math.sin(la)*w*0.45, 0);
+  X.stroke();
+
+  // Shoes
+  X.fillStyle = '#f0f0f0';
+  X.fillRect(-w*0.2 + Math.sin(la)*w*0.45 - w*0.22, -h*0.06, w*0.38, h*0.08);
+  X.fillRect(w*0.2 - Math.sin(la)*w*0.45 - w*0.14, -h*0.06, w*0.38, h*0.08);
+
+  // Jacket body
+  X.fillStyle = '#e63946';
+  X.fillRect(-w*0.44, -h*0.80, w*0.88, h*0.38);
+
+  // Backpack
+  X.fillStyle = '#1565c0';
+  X.fillRect(w*0.22, -h*0.75, w*0.33, h*0.28);
+
+  // Arms
+  X.strokeStyle = '#e63946';
+  X.lineWidth = w * 0.28;
+  X.beginPath();
+  X.moveTo(-w*0.42, -h*0.74);
+  X.lineTo(-w*0.55 + aa*w*0.35, -h*0.44);
+  X.stroke();
+  X.beginPath();
+  X.moveTo(w*0.42, -h*0.74);
+  X.lineTo(w*0.55 - aa*w*0.35, -h*0.44);
+  X.stroke();
+
+  // Head (skin)
+  X.fillStyle = '#c68642';
+  X.beginPath(); X.arc(0, -h*0.90, w*0.44, 0, Math.PI*2); X.fill();
+
+  // Hair
+  X.fillStyle = '#2d1100';
+  X.beginPath(); X.arc(0, -h*0.97, w*0.44, Math.PI*0.9, Math.PI*2.1); X.fill();
+
+  // Face
+  X.fillStyle = 'rgba(0,0,0,0.6)';
+  X.beginPath(); X.arc(-w*0.14, -h*0.88, w*0.07, 0, Math.PI*2); X.fill();
+  X.beginPath(); X.arc(w*0.14, -h*0.88, w*0.07, 0, Math.PI*2); X.fill();
+}
+
+function drawSlideChar(w, h) {
+  // Horizontal crouched body
+  X.fillStyle = '#111';
+  X.fillRect(-w*0.7, -h*0.16, w*0.55, h*0.16);
+  X.fillRect(w*0.20, -h*0.16, w*0.55, h*0.16);
+
+  X.fillStyle = '#f0f0f0';
+  X.fillRect(-w*1.05, -h*0.22, w*0.40, h*0.16);
+  X.fillRect(w*0.65, -h*0.22, w*0.40, h*0.16);
+
+  X.fillStyle = '#e63946';
+  X.fillRect(-w*0.35, -h*0.52, w*1.2, h*0.42);
+
+  X.fillStyle = '#c68642';
+  X.beginPath(); X.arc(w*0.55, -h*0.62, w*0.40, 0, Math.PI*2); X.fill();
+  X.fillStyle = '#2d1100';
+  X.beginPath(); X.arc(w*0.55, -h*0.70, w*0.40, Math.PI, Math.PI*2.1); X.fill();
+}
+
+function drawHUD() {
+  const fs = H * 0.043;
+  X.save();
+  X.textAlign = 'center';
+  X.font = `bold ${fs}px Arial, sans-serif`;
+  X.shadowColor = 'rgba(0,0,0,0.7)';
+  X.shadowBlur = 6;
+  X.fillStyle = '#ffffff';
+  X.fillText(score.toLocaleString(), W/2, H*0.075);
+
+  X.textAlign = 'left';
+  X.font = `bold ${fs*0.80}px Arial`;
+  X.fillStyle = '#ffd700';
+  X.fillText('● ' + coins, W*0.05, H*0.075);
+
+  X.textAlign = 'right';
+  X.fillStyle = 'rgba(255,255,255,0.45)';
+  X.font = `${fs*0.62}px Arial`;
+  X.fillText('×' + spd.toFixed(1), W*0.96, H*0.075);
+
+  X.restore();
+
+  // Controls hint (first 5 seconds)
+  if (tick < 300) {
+    X.save();
+    X.globalAlpha = Math.max(0, 1 - tick / 200);
+    X.textAlign = 'center';
+    X.fillStyle = 'rgba(255,255,255,0.7)';
+    X.font = `${H*0.030}px Arial`;
+    X.fillText('Swipe ←→ lanes  ↑ jump  ↓ slide', W/2, H*0.92);
+    X.restore();
+  }
+}
+
+function rrect(x, y, w, h, r) {
+  X.beginPath();
+  X.moveTo(x+r, y);
+  X.lineTo(x+w-r, y); X.arcTo(x+w,y, x+w,y+r, r);
+  X.lineTo(x+w,y+h-r); X.arcTo(x+w,y+h, x+w-r,y+h, r);
+  X.lineTo(x+r,y+h); X.arcTo(x,y+h, x,y+h-r, r);
+  X.lineTo(x,y+r); X.arcTo(x,y, x+r,y, r);
+  X.closePath();
+}
+
+function drawMenu() {
+  X.fillStyle = 'rgba(0,0,15,0.72)';
+  X.fillRect(0, 0, W, H);
+
+  X.save();
+  X.textAlign = 'center';
+
+  // Title
+  const tg = X.createLinearGradient(0, H*0.18, 0, H*0.40);
+  tg.addColorStop(0, '#ffd700');
+  tg.addColorStop(1, '#ff5500');
+  X.fillStyle = tg;
+  X.shadowColor = '#ff6b35'; X.shadowBlur = 22;
+  X.font = `bold ${H*0.088}px Arial`;
+  X.fillText('SUBWAY', W/2, H*0.27);
+  X.fillText('SURF', W/2, H*0.37);
+  X.shadowBlur = 0;
+
+  X.fillStyle = 'rgba(255,255,255,0.45)';
+  X.font = `${H*0.028}px Arial`;
+  X.fillText('an endless runner', W/2, H*0.44);
+
+  // Control icons
+  const instr = [
+    ['← →', 'change lane'],
+    ['↑', 'jump over barrier'],
+    ['↓', 'slide under bar'],
+  ];
+  X.font = `${H*0.032}px Arial`;
+  for (let i=0; i<instr.length; i++) {
+    X.fillStyle = '#ffd700';
+    X.textAlign = 'right';
+    X.fillText(instr[i][0], W*0.50, H*(0.530 + i*0.057));
+    X.fillStyle = 'rgba(255,255,255,0.75)';
+    X.textAlign = 'left';
+    X.fillText('  ' + instr[i][1], W*0.50, H*(0.530 + i*0.057));
+  }
+
+  // Play button
+  X.fillStyle = '#ffd700';
+  rrect(W*0.18, H*0.72, W*0.64, H*0.105, H*0.028);
+  X.fill();
+  X.fillStyle = '#1a1a2e';
+  X.font = `bold ${H*0.050}px Arial`;
+  X.textAlign = 'center';
+  X.fillText('TAP TO PLAY', W/2, H*0.786);
+
+  if (hi > 0) {
+    X.fillStyle = 'rgba(255,215,0,0.65)';
+    X.font = `${H*0.032}px Arial`;
+    X.fillText('★ Best: ' + hi.toLocaleString(), W/2, H*0.875);
+  }
+  X.restore();
+}
+
+function drawDead() {
+  X.fillStyle = 'rgba(0,0,15,0.82)';
+  X.fillRect(0, 0, W, H);
+
+  X.save();
+  X.textAlign = 'center';
+
+  X.fillStyle = '#e63946';
+  X.shadowColor = '#e63946'; X.shadowBlur = 18;
+  X.font = `bold ${H*0.072}px Arial`;
+  X.fillText('GAME OVER', W/2, H*0.20);
+  X.shadowBlur = 0;
+
+  // Score card
+  X.fillStyle = 'rgba(255,255,255,0.07)';
+  rrect(W*0.10, H*0.25, W*0.80, H*0.36, H*0.022);
+  X.fill();
+  X.strokeStyle = 'rgba(255,255,255,0.12)';
+  X.lineWidth = 1; X.stroke();
+
+  X.fillStyle = 'rgba(255,255,255,0.55)';
+  X.font = `${H*0.036}px Arial`;
+  X.fillText('SCORE', W/2, H*0.325);
+
+  X.fillStyle = '#ffd700';
+  X.font = `bold ${H*0.075}px Arial`;
+  X.fillText(score.toLocaleString(), W/2, H*0.415);
+
+  X.fillStyle = 'rgba(255,255,255,0.6)';
+  X.font = `${H*0.035}px Arial`;
+  X.fillText('● ' + coins + '  coins', W/2, H*0.502);
+
+  const newBest = score >= hi;
+  X.fillStyle = newBest ? '#ffd700' : 'rgba(255,215,0,0.55)';
+  X.font = `${H*0.032}px Arial`;
+  X.fillText((newBest ? '⭐ NEW BEST! ' : '★ Best: ') + hi.toLocaleString(), W/2, H*0.567);
+
+  // Play again
+  X.fillStyle = '#ffd700';
+  rrect(W*0.15, H*0.67, W*0.70, H*0.105, H*0.028);
+  X.fill();
+  X.fillStyle = '#1a1a2e';
+  X.font = `bold ${H*0.050}px Arial`;
+  X.fillText('PLAY AGAIN', W/2, H*0.736);
+
+  X.restore();
+}
+
+// ─── GAME LOOP ────────────────────────────────────────────────────────────────
+function frame() {
+  update();
+
+  X.clearRect(0, 0, W, H);
+  drawBackground();
+  drawTrack();
+  drawWorld();
+  drawCharacter();
+
+  if (gs === 'playing') {
+    drawHUD();
+    // Red flash on death
+    if (PL.dead) {
+      const dt = tick - PL.deathTick;
+      const alpha = 0.4 * Math.max(0, 1 - dt / 60) * (0.7 + Math.sin(dt * 0.5) * 0.3);
+      X.fillStyle = `rgba(220,30,20,${alpha})`;
+      X.fillRect(0, 0, W, H);
+    }
+  }
+  if (gs === 'menu') drawMenu();
+  if (gs === 'dead')  drawDead();
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ─── INPUT ────────────────────────────────────────────────────────────────────
+function resetGame() {
+  score = 0; coins = 0; dist = 0; spd = 3; tick = 0;
+  WORLD = []; spawnCd = 50;
+  Object.assign(PL, {
+    cur:1, tgt:1, jumping:false, jt:0,
+    sliding:false, st:0, dead:false, deathTick:0,
+    runT:0, inv:0
+  });
+  gs = 'playing';
+}
+
+function doLeft() {
+  if (gs !== 'playing' || PL.dead) return;
+  if (PL.tgt > 0) PL.tgt--;
+}
+function doRight() {
+  if (gs !== 'playing' || PL.dead) return;
+  if (PL.tgt < 2) PL.tgt++;
+}
+function doJump() {
+  if (gs !== 'playing' || PL.dead) return;
+  if (!PL.jumping) {
+    PL.jumping = true; PL.jt = 0;
+    PL.sliding = false; PL.st = 0;
+  }
+}
+function doSlide() {
+  if (gs !== 'playing' || PL.dead) return;
+  if (!PL.jumping) {
+    PL.sliding = true; PL.st = 38;
+  }
+}
+function doActivate() {
+  if (gs === 'menu' || gs === 'dead') resetGame();
+}
+
+// Keyboard
+window.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft'  || e.key === 'a') { doActivate(); doLeft(); }
+  else if (e.key === 'ArrowRight' || e.key === 'd') { doActivate(); doRight(); }
+  else if (e.key === 'ArrowUp' || e.key === 'w' || e.key === ' ') { doActivate(); doJump(); }
+  else if (e.key === 'ArrowDown' || e.key === 's') { doActivate(); doSlide(); }
+  else doActivate();
+  e.preventDefault();
+});
+
+// Touch
+let tx0 = 0, ty0 = 0, tMoved = false;
+C.addEventListener('touchstart', e => {
+  e.preventDefault();
+  tx0 = e.touches[0].clientX;
+  ty0 = e.touches[0].clientY;
+  tMoved = false;
+  doActivate();
+}, { passive: false });
+
+C.addEventListener('touchmove', e => {
+  e.preventDefault();
+  const dx = e.touches[0].clientX - tx0;
+  const dy = e.touches[0].clientY - ty0;
+  const adx = Math.abs(dx), ady = Math.abs(dy);
+  if (!tMoved && (adx > 18 || ady > 18)) {
+    tMoved = true;
+    if (adx >= ady) { dx < 0 ? doLeft() : doRight(); }
+    else { dy < 0 ? doJump() : doSlide(); }
+  }
+}, { passive: false });
+
+C.addEventListener('touchend', e => {
+  e.preventDefault();
+  if (!tMoved) doJump(); // tap with no swipe = jump
+}, { passive: false });
+</script>
+</body>
+</html>
